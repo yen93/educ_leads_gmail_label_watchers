@@ -1,0 +1,27 @@
+# Dependencies
+node_modules/
+
+# Environment / secrets
+.env
+*.env
+.env.*
+secrets/
+
+# Credentials / keys (never commit)
+*.pem
+*.key
+*service_account*.json
+*service-account*.json
+*-key.json
+*token*.txt
+*secret*.txt
+*creds*.txt
+SUPABASE_ACCESS_TOKEN.txt
+
+# Supabase CLI local state
+supabase/.temp/
+supabase/.branches/
+
+# OS / editor noise
+.DS_Store
+Thumbs.db

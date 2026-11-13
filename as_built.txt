@@ -1,0 +1,100 @@
+================================================================================
+AS-BUILT — educ_leads_gmail_label_watchers
+Last updated: 2026-11-13
+================================================================================
+
+PURPOSE
+- Two Gmail "routers" (Supabase edge functions) that triage the education-sector
+  outbound follow-up sequence running in james@myadventuregroup.com.au:
+    1. educ-bounced-threads-router (DAILY cron) — bounced/blocked threads leave the
+       sequence and go to follow-up-sequence-closed; their lead is set to '10A'.
+    2. lead-response-router (PUSH) — threads where the lead replied go to
+       @ sales to action/outbound lead responses; their lead is set to '8A'.
+- Both operate on the SAME mailbox the sibling gmail_drafter
+  (email_drafter_edge_function) uses, via the same OAuth refresh-token auth, and the
+  SAME Supabase project (MAGTestProject, aivitcomiywiysrfwqxt).
+
+STATUS
+- DEPLOYED and LIVE on MAGTestProject (verify_jwt=false on both functions).
+- educ-bounced-threads-router: v2. Daily cron scheduled (06:00 PH). Verified end-to-end
+  (moved a real bounce; email->lead '10A' update path verified via backfill).
+- lead-response-router: v1. Second Pub/Sub push subscription created and receiving
+  pushes. Verified end-to-end live (reply from testertwo.myadventuregroup@gmail.com
+  routed the thread and set the lead to '8A').
+
+GMAIL TARGET MAILBOX / AUTH
+- Mailbox: james@myadventuregroup.com.au. Gmail calls act as users/me.
+- Auth: OAuth refresh-token flow (NOT domain-wide delegation), reusing the drafter's
+  credential. Shared secrets (already set on the project):
+  GMAIL_OAUTH_CLIENT_ID / GMAIL_OAUTH_CLIENT_SECRET / GMAIL_OAUTH_REFRESH_TOKEN.
+  GMAIL_IMPERSONATE_USER = james@... (used as the mailbox id / state key).
+
+GMAIL LABELS (search tokens -> resolved to real IDs at runtime, separator-insensitive)
+- educ_label      = follow-up-sequence-ed-sector            (source, both routers)
+- closed_label    = follow-up-sequence-closed               (bounced target)
+- responses_label = @-sales-to-action-outbound-lead-responses (response target)
+
+EDGE FUNCTIONS (Deno/TypeScript, supabase/functions/; both verify_jwt=FALSE; ?token= auth)
+- educ-bounced-threads-router/index.ts — DAILY. Pages label:follow-up-sequence-ed-sector,
+  detects bounced/blocked threads (From mailer-daemon/postmaster; DSN subjects; an
+  X-Failed-Recipients header; a multipart/report or message/delivery-status part), moves
+  each to follow-up-sequence-closed (atomic add+remove), and sets the matching lead(s) to
+  '10A' in manually_found_educ_leads (matched by failed-recipient / outbound-To email).
+  Optional ?thread=<id> processes one thread (backfill/test). MAX_THREADS=1000/run.
+- lead-response-router/index.ts — PUSH target. Self-seeds its own baseline
+  (educ_watch_state) on first push; uses history.list over INBOX to find inbound replies;
+  for a genuine lead reply on an ed-sector thread, moves the thread to the responses label
+  (atomic add+remove) and sets the lead(s) to '8A' (matched by responder/outbound email).
+  Skips our own sends, mailer-daemon/bounces, no-reply, internal, self. Idempotent via
+  educ_processed_messages. Optional ?thread=<id> processes one thread (backfill/test).
+- _shared/google-auth.ts — OAuth refresh-token -> 1h access-token (verbatim from drafter).
+- _shared/gmail.ts — gfetch; listHistory (INBOX etc.); listThreads; getThread (metadata:
+  From/To/Subject/X-Failed-Recipients + labelIds); modifyThreadLabels (atomic add/remove);
+  listLabels; resolveLabelIds / getOrCreateLabelId (separator-insensitive); header;
+  hasMimeType.
+- _shared/labels.ts — EDUC_LABEL_TOKEN / CLOSED_LABEL_TOKEN / RESPONSES_LABEL_TOKEN.
+
+DATA STORES (public schema on aivitcomiywiysrfwqxt; RLS ON, no policies = service_role only)
+- educ_router_runs — append-only audit log of each router run (router, ran_at, scanned,
+  bounced, moved, leads_updated, errors, detail jsonb). Migrations 0001 + 0002.
+- educ_watch_state — lead-response-router's OWN processing baseline (email_address PK,
+  last_history_id). Separate from the drafter's gmail_watch_state. Migration 0003.
+- educ_processed_messages — idempotency ledger for lead-response-router (message_id PK,
+  thread_id, action 'responded'|'skip'). Migration 0003.
+- manually_found_educ_leads (PRE-EXISTING, read+write) — lead rows. Updated in place:
+  status -> '10A' (bounced) or '8A' (responded), matched by email. Never truncated.
+
+EXTERNAL INTEGRATIONS
+- Gmail API (gmail.googleapis.com, users/me) — threads.list/get, history.list,
+  threads.modify, labels. Auth = OAuth refresh token for james@.
+- Google Cloud Pub/Sub (project n8nautomations-498202, topic gmail-inbound) — SHARED with
+  gmail_drafter. lead-response-router rides it via a SECOND push subscription,
+  gmail-inbound-lead-response-push -> the lead-response-router URL. No new watch is armed
+  (Gmail allows only one users.watch per mailbox; the drafter's daily renewal keeps it
+  alive; INBOX coverage catches lead replies).
+- Supabase (PostgREST + edge runtime) — hosts functions + state tables.
+
+SECRETS (Supabase edge-function secrets; NONE in the repo)
+- GMAIL_OAUTH_CLIENT_ID / GMAIL_OAUTH_CLIENT_SECRET / GMAIL_OAUTH_REFRESH_TOKEN,
+  GMAIL_IMPERSONATE_USER, PUSH_SHARED_SECRET (shared with the drafter; also embedded in
+  the renew-gmail-watch-daily cron URL). SUPABASE_URL / SUPABASE_SERVICE_ROLE_KEY are
+  injected automatically.
+
+AUTOMATIONS / ROUTINES
+- educ-bounced-threads-router-daily — pg_cron on aivitcomiywiysrfwqxt (jobid 38,
+  '0 22 * * *' = 06:00 PH), POSTs the function URL with ?token= via pg_net.
+- lead-response-router — not scheduled; invoked by Pub/Sub push on each INBOX change
+  (via subscription gmail-inbound-lead-response-push).
+
+DEPLOY NOTES
+- Deploy via Supabase MCP deploy_edge_function (the CLI is blocked on this machine). MCP
+  does NOT bundle from disk, so pass the entrypoint + ALL _shared/*.ts files each deploy,
+  keeping verify_jwt=false.
+- The Pub/Sub subscription for lead-response-router must be created in GCP project
+  n8nautomations-498202 (see supabase/SETUP-lead-response-router.md).
+
+REFERENCE FILES
+- supabase/SETUP-lead-response-router.md — the one manual GCP step + verification.
+- supabase/schedule_bounced_router.sql — the daily cron template (already applied).
+- prompts/131126_first_prompt.txt — the original task spec.
+================================================================================

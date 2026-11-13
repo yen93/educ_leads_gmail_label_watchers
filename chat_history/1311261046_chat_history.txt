@@ -1,0 +1,124 @@
+================================================================================
+CHAT HISTORY EXPORT — 2026-11-13
+Session: Build two Gmail label "routers" (Supabase edge functions) for the
+education-sector outbound follow-up sequence on james@'s mailbox —
+main_task 1 (bounced_threads_router) and main_task 2 (lead_response_router).
+================================================================================
+
+NOTE ON REDACTIONS: This session used the shared push secret (PUSH_SHARED_SECRET)
+in function URLs and cron/subscription commands. Every occurrence of its literal
+value has been replaced with [REDACTED_PUSH_SHARED_SECRET]. The value lives as a
+Supabase edge-function secret and is embedded in the existing renew-gmail-watch-daily
+cron URL; it was reused (not newly minted) this session.
+
+--------------------------------------------------------------------------------
+USER:
+Pointed at prompts/131126_first_prompt.txt, which defines:
+  educ_label      = label:follow-up-sequence-ed-sector
+  closed_label    = label:follow-up-sequence-closed
+  responses_label = label:@-sales-to-action-outbound-lead-responses
+  gmail_drafter   = C:\Users\Cloverly\claude_code\email_drafter_edge_function
+  main_task 1 (bounced_threads_router): a router inside educ_label that routes
+    blocked/bounced threads to closed_label; runs once a day at 6am PH time.
+  main_task 2 (lead_response_router): a second router inside educ_label that routes
+    any thread that got a response to responses_label; uses Gmail Pub/Sub push
+    "just like gmail_drafter".
+
+--------------------------------------------------------------------------------
+ASSISTANT:
+Explored the (near-empty) target project and the full gmail_drafter reference
+(CLAUDE.md, as_built.txt, RUNBOOK, _shared/google-auth.ts + gmail.ts, both index.ts,
+migration, cron SQL). Established the key facts that shape everything:
+  - The three target labels are NOT in the connected julienne@ mailbox — they live in
+    james@myadventuregroup.com.au, the mailbox gmail_drafter operates on via an OAuth
+    refresh token (NOT domain-wide delegation).
+  - Gmail allows only ONE users.watch per mailbox, and gmail_drafter already owns the
+    live watch + Pub/Sub topic (projects/n8nautomations-498202/topics/gmail-inbound)
+    pushing to draft-james-reply. So a push-based router can't arm its own watch.
+  - Supabase project = MAGTestProject (aivitcomiywiysrfwqxt). Deploy via Supabase MCP
+    (the CLI is blocked by Windows App Control on this machine).
+  - 6am PH = 22:00 UTC ('0 22 * * *'), confirmed against existing daily *-sync crons.
+  - PUSH_SHARED_SECRET is already set and embedded in the renew-gmail-watch-daily cron
+    URL — reused for the new functions' ?token= auth.
+
+Entered plan mode. User said "just work on the first task for now." Asked two
+clarifying questions; user chose: bounce detection = DSN + mailer-daemon (robust); and
+build + deploy live. Wrote plan, got approval.
+
+TASK 1 — built educ-bounced-threads-router (scheduled-only; no watch/Pub/Sub, so it
+can't disturb the drafter):
+  - supabase/functions/_shared/google-auth.ts (verbatim copy of the drafter's),
+    labels.ts (EDUC/CLOSED/RESPONSES tokens), gmail.ts (trimmed + listThreads,
+    getThread metadata, modifyThreadLabels, resolveLabelIds, getOrCreateLabelId,
+    header, hasMimeType, later listHistory).
+  - functions/educ-bounced-threads-router/index.ts: scans label:follow-up-sequence-
+    ed-sector, detects bounced threads (mailer-daemon/postmaster From, DSN subjects,
+    X-Failed-Recipients header, multipart/report or message/delivery-status part),
+    and MOVES each to follow-up-sequence-closed (add closed + remove ed-sector,
+    atomic). Logs to a new audit table educ_router_runs.
+  - migration 0001_educ_router_state.sql (educ_router_runs). Applied.
+  - Deployed via MCP (verify_jwt=false). Test run: HTTP 200, scanned 38, bounced 1,
+    moved 1, errors 0 — moved thread "Planning your 2027 education events?"
+    (1a1d2560e52d3e75), a genuine bounce.
+  - Scheduled cron educ-bounced-threads-router-daily '0 22 * * *' (jobid 38), reusing
+    PUSH_SHARED_SECRET (read out of the existing renew cron).
+
+Minor update requested: bounced threads should also set manually_found_educ_leads.status
+= '10A'. Inspected the table (has email, status, thread_id). The stored thread_id is the
+OUTBOUND thread, which differs from the bounce thread id, so matching must be by EMAIL
+(user confirmed). Added:
+  - To the function: extract failed-recipient email(s) from X-Failed-Recipients + the
+    outbound To (internal @myadventuregroup.com.au dropped), then UPDATE
+    manually_found_educ_leads SET status='10A' WHERE email IN (...). Added a
+    leads_updated column (migration 0002) and an optional ?thread=<id> single-thread
+    backfill/test mode. Added "To" to getThread's default metadata headers. Redeployed
+    (v2).
+  - Backfilled the already-moved thread via ?thread=: it extracted jmcguire@ggs.vic.edu.au
+    but 0 leads updated at the time (row not yet present).
+
+User asked (via /q, read-only) why no row was 10A; explained the one detected bounce's
+lead wasn't in the table. User said "check table again", then selected the jmcguire row —
+it WAS now present (id 50, status 1B, thread_id 1a1d2560e52d3e75); the table had been
+repopulated between checks. Diagnosed the ordering artifact: the thread was moved out of
+ed-sector during the first test (so the daily scan won't revisit it) and the earlier
+backfill ran before the row existed. User said "fire now"; re-ran ?thread=1a1d2560e52d3e75
+— row 50 flipped to 10A. Final: 37×1B, 1×10A. Confirmed normal operation won't hit this
+ordering problem (bounce caught while the lead row exists and the thread is still in
+ed-sector).
+
+TASK 2 — built lead-response-router (PUSH-based, piggybacking the drafter's watch/topic):
+  - Added RESPONSES_LABEL_TOKEN to labels.ts and listHistory to gmail.ts.
+  - migration 0003_educ_watch_state.sql: educ_watch_state (own baseline, separate from
+    the drafter's gmail_watch_state) + educ_processed_messages (idempotency ledger).
+    Applied.
+  - functions/lead-response-router/index.ts: Pub/Sub push target (?token= auth,
+    verify_jwt=false). Self-seeds its baseline on first push. Uses listHistory over
+    INBOX to find new inbound messages; for each, loads the thread, confirms the message
+    is a genuine inbound reply (not SENT/DRAFT, not mailer-daemon/bounce, not no-reply,
+    not internal, not self) and that the thread carries follow-up-sequence-ed-sector;
+    then MOVES the thread to @ sales to action/outbound lead responses (add responses +
+    remove ed-sector, atomic) and sets manually_found_educ_leads.status='8A' matched by
+    the responder's email. Idempotency via educ_processed_messages; per-message lock
+    with release-on-error for retry. Optional ?thread=<id> test/backfill mode. Logs to
+    educ_router_runs (router='lead-response-router') when it routes or errors.
+  - Deployed via MCP (v1, verify_jwt=false). Smoke test (?thread= on a non-ed-sector
+    thread) returned 200, routed 0, zero mutation.
+  - Wrote supabase/SETUP-lead-response-router.md documenting the one manual GCP step.
+
+Explained the single-watch constraint and that only one manual step remained: creating a
+SECOND Pub/Sub push subscription on the existing topic. User ran gcloud (auth expired →
+gcloud auth login as julienne@ → re-ran), and successfully created subscription
+gmail-inbound-lead-response-push → the lead-response-router URL
+(?token=[REDACTED_PUSH_SHARED_SECRET]), ack 60s, project n8nautomations-498202.
+
+User tested live with testertwo.myadventuregroup@gmail.com replying to an ed-sector
+thread — it worked (thread routed, lead set to 8A). Then ran /dcp.
+
+Open items flagged (not yet decided by user): (1) move vs. keep ed-sector on a response
+(currently MOVE); (2) whether to stop draft-james-reply from auto-drafting once a lead
+has responded (both functions see the same INBOX push); (3) optional one-time backfill
+scan of existing ed-sector threads that already got replies.
+
+================================================================================
+END OF EXPORT
+================================================================================

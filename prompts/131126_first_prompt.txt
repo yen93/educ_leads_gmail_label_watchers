@@ -1,0 +1,20 @@
+**educ_label:**
+label:follow-up-sequence-ed-sector 
+
+**closed_label:**
+label:follow-up-sequence-closed 
+
+**responses_label:**
+label:@-sales-to-action-outbound-lead-responses 
+
+**gmail_drafter:**
+C:\Users\Cloverly\claude_code\email_drafter_edge_function
+
+## main_task 1:
+bounced_threads_router: create a router inside educ_label to route blocked or bounced threads. they are to be moved to closed_label.
+- bounced_threads_router only needs to run once a day at 6 am ph time.
+
+## main_task 2:
+lead_response_router: create a second router inside educ_label to route any thread that got a response to  responses_label.
+- lead_response_router should use Gmail Pub/Sub push notification just like gmail_drafter
+- update each routed lead in manually_found_educ_leads table. set status to '8A'
